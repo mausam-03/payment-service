@@ -13,3 +13,509 @@ datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
+
+model Product {
+  id       String  @id @default(uuid())
+  name     String
+  code     String  @unique // lms, ebook, ppt, etc.
+  isActive Boolean @default(true)
+
+  apiKeys         ApiKey[]
+  users           ProductUser[]
+  plans           ProductPlan[]
+  subscriptions   Subscription[]
+  orders          Order[]
+  requestLogs     ApiRequestLog[]
+  idempotencyKeys IdempotencyKey[]
+  webhookConfigs  ProductWebhookConfig[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+
+  @@index([code]) // ADD: Fast lookup by code
+  @@index([isActive]) // ADD: Fast filtering of active products
+}
+
+model ApiKey {
+  id        String @id @default(uuid())
+  productId String
+
+  keyName     String // e.g., "production-key", "staging-key"
+  keyHash     String @unique // bcrypt hash of the actual key
+  keyPrefix   String // e.g., "pk_live_lms_" for quick lookup
+  environment String @default("production") // production, staging, development
+
+  permissions     String[] // ["charge", "refund", "read"]
+  rateLimitPerMin Int      @default(100)
+
+  isActive   Boolean   @default(true)
+  expiresAt  DateTime?
+  lastUsedAt DateTime?
+
+  product         Product            @relation(fields: [productId], references: [id], onDelete: Cascade) // CHANGE: Add onDelete
+  requestLogs     ApiRequestLog[]
+  rateLimits      RateLimitTracker[]
+  idempotencyKeys IdempotencyKey[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+
+  @@index([keyPrefix])
+  @@index([productId])
+  @@index([isActive]) // ADD: Fast filtering of active keys
+  @@index([expiresAt]) // ADD: Fast finding of expired keys
+}
+
+model RateLimitTracker {
+  id       String @id @default(uuid())
+  apiKeyId String
+
+  windowStart  DateTime // Start of the current minute window
+  requestCount Int      @default(0)
+
+  apiKey ApiKey @relation(fields: [apiKeyId], references: [id], onDelete: Cascade)
+
+  @@unique([apiKeyId, windowStart])
+  @@index([windowStart])
+}
+
+model ApiRequestLog {
+  id        String  @id @default(uuid())
+  apiKeyId  String?
+  productId String?
+
+  endpoint       String
+  method         String
+  statusCode     Int?
+  ipAddress      String?
+  userAgent      String?
+  requestBody    Json?
+  responseTimeMs Int?
+  errorMessage   String?
+
+  apiKey  ApiKey?  @relation(fields: [apiKeyId], references: [id], onDelete: SetNull) // CHANGE: Keep logs when key deleted
+  product Product? @relation(fields: [productId], references: [id], onDelete: SetNull) // CHANGE: Keep logs when product deleted
+
+  createdAt DateTime @default(now())
+
+  @@index([apiKeyId])
+  @@index([productId])
+  @@index([createdAt])
+  @@index([statusCode]) // Fast filtering by status (for error reports)
+}
+
+model ProductUser {
+  id             String  @id @default(uuid())
+  productId      String
+  externalUserId String // userId from calling product
+  email          String?
+
+  tilledCustomerId        String?
+  tilledCustomerCreatedAt DateTime?
+
+  product       Product        @relation(fields: [productId], references: [id], onDelete: Cascade) // CHANGE: Add onDelete
+  subscriptions Subscription[]
+  orders        Order[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+
+  @@unique([productId, externalUserId])
+  @@index([productId])
+  @@index([email]) // Fast lookup by email
+  @@index([tilledCustomerId])
+}
+
+model Order {
+  id             String  @id @default(uuid())
+  productId      String
+  productUserId  String
+  planId         String //made it mandatory
+  subscriptionId String?
+
+  orderType OrderType @default(ONE_TIME)
+
+  referenceId String // order id from product system
+  // idempotencyKey String? @unique // prevent duplicate charges
+
+  amount   Int // smallest currency unit (cents / paise)
+  currency String      @default("USD")
+  status   OrderStatus @default(CREATED)
+
+  metadata Json?
+
+  product      Product       @relation(fields: [productId], references: [id], onDelete: Restrict) // CHANGE: Prevent deletion if orders exist
+  productUser  ProductUser   @relation(fields: [productUserId], references: [id], onDelete: Restrict) // CHANGE: Prevent deletion if orders exist
+  plan         ProductPlan   @relation(fields: [planId], references: [id], onDelete: Restrict)
+  subscription Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+
+  items    OrderItem[]
+  payments Payment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+
+  @@unique([productId, referenceId])
+  // @@index([idempotencyKey])
+  @@index([status]) // Fast filtering by status
+  @@index([productId, status]) // Composite index for common query
+  @@index([createdAt]) // Fast date range queries
+}
+
+model OrderItem {
+  id      String @id @default(uuid())
+  orderId String
+
+  name     String
+  sku      String?
+  quantity Int     @default(1)
+  price    Int // per unit price (smallest currency unit)
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId]) // Already has FK, but explicit index helps
+  @@index([sku]) // Fast lookup by SKU
+}
+
+model Payment {
+  id      String @id @default(uuid())
+  orderId String
+
+  tilledPaymentId       String?       @unique // CHANGE: Make unique to prevent duplicates
+  tilledPaymentMethodId String? // payment_method_id from Tilled payment intent (needed for subscriptions)
+  method                PaymentMethod
+  status                PaymentStatus
+  amount                Int
+
+  rawRequest  Json?
+  rawResponse Json?
+
+  order   Order    @relation(fields: [orderId], references: [id], onDelete: Restrict) // CHANGE: Prevent deletion if payments exist
+  refunds Refund[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime? @default(now()) @updatedAt
+
+  @@index([tilledPaymentId])
+  @@index([orderId]) // Fast lookup by order
+  @@index([status]) // Fast filtering by status
+}
+
+model Refund {
+  id        String @id @default(uuid())
+  paymentId String
+
+  tilledRefundId String?      @unique
+  amount         Int
+  status         RefundStatus
+  reason         String?
+
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Restrict) // CHANGE: Prevent deletion if refunds exist
+
+  createdAt DateTime @default(now())
+
+  @@index([tilledRefundId])
+  @@index([paymentId]) // Fast lookup by payment
+  @@index([status]) // Fast filtering by status
+}
+
+model WebhookEvent {
+  id        String  @id @default(uuid())
+  eventType String
+  tilledId  String
+  payload   Json
+  processed Boolean @default(false)
+
+  createdAt   DateTime  @default(now())
+  processedAt DateTime?
+
+  @@unique([eventType, tilledId])
+  @@index([processed])
+  @@index([eventType])
+  @@index([createdAt])
+}
+
+model IdempotencyKey {
+  id        String  @id @default(uuid())
+  productId String
+  apiKeyId  String?
+
+  key         String
+  method      String
+  path        String
+  requestHash String
+
+  status             IdempotencyStatus @default(IN_PROGRESS)
+  checkoutUrl        String?
+  orderId            String?
+  paymentId          String?
+  responseStatusCode Int?
+  responseBody       Json?
+
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  apiKey  ApiKey? @relation(fields: [apiKeyId], references: [id], onDelete: SetNull)
+
+  @@unique([productId, key, method, path])
+  @@index([productId, createdAt])
+  @@index([expiresAt])
+  @@index([orderId])
+}
+
+model ProductPlan {
+  id          String      @id @default(uuid())
+  productId   String
+  code        String?
+  name        String
+  description String?
+  price       Int
+  currency    String      @default("USD")
+  billingType BillingType
+
+  interval      BillingInterval?
+  intervalCount Int?
+  isActive      Boolean          @default(true)
+
+  metadata Json?
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  subscriptions Subscription[]
+  orders        Order[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+
+  @@unique([productId, code])
+  @@index([productId])
+  @@index([billingType])
+}
+
+model Subscription {
+  id String @id @default(uuid())
+
+  productId     String
+  productUserId String
+  planId        String
+
+  tilledSubscriptionId String? @unique
+
+  status SubscriptionStatus
+
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+
+  cancelAtPeriodEnd Boolean   @default(false)
+  cancelledAt       DateTime?
+
+  metadata Json?
+
+  product     Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  productUser ProductUser @relation(fields: [productUserId], references: [id], onDelete: Cascade)
+  plan        ProductPlan @relation(fields: [planId], references: [id], onDelete: Restrict)
+
+  orders Order[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+
+  @@index([productId])
+  @@index([productUserId])
+  @@index([status])
+}
+
+model AuditLog {
+  id String @id @default(uuid())
+
+  // Core Required Info
+  userId        String?
+  userName      String?
+  paymentStatus String?
+  timestamp     DateTime @default(now())
+
+  // Service Context
+  serviceName String
+  eventType   AuditEventType
+  status      AuditStatus
+
+  // Business References
+  productId      String?
+  apiKeyId       String?
+  orderId        String?
+  paymentId      String?
+  refundId       String?
+  subscriptionId String?
+
+  // Request Context (Helpful for Debugging & Security)
+  ipAddress  String?
+  httpMethod String?
+  path       String?
+  requestId  String?
+
+  // Flexible Data Storage
+  metadata     Json?
+  errorMessage String?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([productId])
+  @@index([apiKeyId])
+  @@index([orderId])
+  @@index([paymentId])
+  @@index([eventType])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model ProductWebhookConfig {
+  id           String @id @default(uuid())
+  productId    String
+  triggerEvent String // Which webhook event triggers this
+
+  callbackUrl  String
+  httpMethod   HttpMethod        @default(POST)
+  authType     OutgoingAuthType? @default(BEARER_TOKEN) // Auth for the outgoing request
+  authSecret   String? // encrypted token/key to send to them
+  headers      Json? // extra headers to include
+  bodyTemplate Json? // template with placeholders like {{orderId}}, {{userId}}
+  maxRetries   Int?              @default(3)
+  retryDelayMs Int?              @default(1000)
+
+  isActive Boolean @default(true)
+
+  product    Product                   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  deliveries OutgoingWebhookDelivery[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+
+  @@index([productId])
+  @@index([isActive])
+}
+
+model OutgoingWebhookDelivery {
+  id       String  @id @default(uuid())
+  configId String
+  orderId  String?
+
+  attemptNumber Int?     @default(1)
+  statusCode    Int?
+  requestBody   Json?
+  responseBody  String?
+  errorMessage  String?
+  success       Boolean? @default(false)
+
+  deliveredAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  config ProductWebhookConfig @relation(fields: [configId], references: [id], onDelete: Cascade)
+
+  @@index([configId])
+  @@index([orderId])
+  @@index([success])
+  @@index([createdAt])
+}
+
+enum OrderStatus {
+  CREATED
+  PENDING
+  PAID
+  FAILED
+  CANCELLED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum IdempotencyStatus {
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  INITIATED
+  PROCESSING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CARD
+  ACH
+  WALLET
+}
+
+enum RefundStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+enum BillingType {
+  ONE_TIME
+  RECURRING
+}
+
+enum BillingInterval {
+  MONTH
+  YEAR
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  INACTIVE
+  CANCELLED
+  PAST_DUE
+  TRIAL
+}
+
+enum AuditStatus {
+  SUCCESS
+  FAILED
+}
+
+enum AuditEventType {
+  ORDER_CREATED
+  ORDER_UPDATED
+  PAYMENT_INITIATED
+  PAYMENT_SUCCEEDED
+  PAYMENT_FAILED
+  REFUND_INITIATED
+  REFUND_SUCCEEDED
+  REFUND_FAILED
+  SUBSCRIPTION_CREATED
+  SUBSCRIPTION_CANCELLED
+  WEBHOOK_RECEIVED
+  API_KEY_CREATED
+  API_KEY_REVOKED
+}
+
+enum OrderType {
+  ONE_TIME
+  SUBSCRIPTION
+  CANCEL
+  REFUND
+  OTHER
+}
+
+enum OutgoingAuthType {
+  BEARER_TOKEN
+  API_KEY_HEADER
+  BASIC_AUTH
+  HMAC_SIGNATURE
+  NONE
+}
+
+enum HttpMethod {
+  POST
+  PUT
+  PATCH
+  GET
+}
